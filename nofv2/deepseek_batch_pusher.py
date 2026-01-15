@@ -1,0 +1,1051 @@
+import json
+import asyncio
+import logging
+import aiohttp
+from aiohttp_socks import ProxyConnector
+import html
+from decimal import Decimal
+import time
+import re
+from concurrent.futures import ThreadPoolExecutor
+from config import CLAUDE_API_KEY, CLAUDE_MODEL, CLAUDE_URL, AI_PROVIDER, timeframes, PROXY
+from config import MIMO_API_KEY, MIMO_MODEL, MIMO_URL
+from database import redis_client
+from volume_stats import get_open_interest, get_funding_rate, get_24hr_change
+from account_positions import account_snapshot, tp_sl_cache
+from trend_alignment import calculate_trend_alignment
+
+_preload_executor = ThreadPoolExecutor(max_workers=12)
+
+KEY_REQ = "deepseek_analysis_request_history"
+KEY_RES = "deepseek_analysis_response_history"
+
+batch_cache = {}
+
+# ================== 全局 HTTP Session（进程级） ==================
+_http_session = None
+_http_session_no_proxy = None  # 用于本地请求（不走代理）
+
+async def init_http_session():
+    """
+    初始化全局 HTTP Session（只做一次）
+    支持代理配置
+    """
+    global _http_session, _http_session_no_proxy
+
+    if _http_session is None or _http_session.closed:
+        if PROXY:
+            connector = ProxyConnector.from_url(PROXY)
+            _http_session = aiohttp.ClientSession(connector=connector)
+            print(f"🌐 全局 HTTP Session 已初始化 (代理: {PROXY})")
+        else:
+            _http_session = aiohttp.ClientSession()
+            print("🌐 全局 HTTP Session 已初始化")
+    
+    # 初始化无代理 Session（用于本地请求）
+    if _http_session_no_proxy is None or _http_session_no_proxy.closed:
+        _http_session_no_proxy = aiohttp.ClientSession()
+        print("🌐 无代理 HTTP Session 已初始化（用于本地请求）")
+
+async def get_http_session(url: str = None) -> aiohttp.ClientSession:
+    """
+    获取 HTTP Session
+    如果 URL 是本地地址，返回无代理的 Session
+    """
+    if _http_session is None or _http_session.closed:
+        raise RuntimeError("HTTP Session 尚未初始化，请先调用 init_http_session()")
+    
+    # 本地地址不走代理
+    if url and ("localhost" in url or "127.0.0.1" in url):
+        if _http_session_no_proxy is None or _http_session_no_proxy.closed:
+            raise RuntimeError("无代理 HTTP Session 尚未初始化")
+        return _http_session_no_proxy
+    
+    return _http_session
+
+async def close_http_session():
+    """
+    程序退出时调用，优雅关闭
+    """
+    global _http_session, _http_session_no_proxy
+
+    if _http_session is not None:
+        await _http_session.close()
+        _http_session = None
+        print("🛑 全局 HTTP Session 已关闭")
+    
+    if _http_session_no_proxy is not None:
+        await _http_session_no_proxy.close()
+        _http_session_no_proxy = None
+        print("🛑 无代理 HTTP Session 已关闭")
+
+def json_safe_dumps(obj):
+    import numpy as np
+    def default_handler(x):
+        if isinstance(x, Decimal):
+            return float(x)
+        if isinstance(x, (np.bool_, np.integer)):
+            return int(x)
+        if isinstance(x, np.floating):
+            return float(x)
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+        return str(x)
+    
+    return json.dumps(
+        obj,
+        ensure_ascii=False,
+        default=default_handler
+    )
+
+# ================== Batch 管理 ==================
+def add_to_batch(symbol, interval, indicators=None):
+    if symbol not in batch_cache:
+        batch_cache[symbol] = {}
+
+    payload = {}
+    if indicators is not None:
+        payload["indicators"] = indicators
+
+    batch_cache[symbol][interval] = payload
+
+def _is_ready_for_push():
+    """
+    检查 batch_cache 是否有至少一个币种有数据。
+    放宽要求，不再强制每个周期都必须完整。
+    """
+    if not batch_cache:
+        print("⚠️ batch_cache 为空，无法投喂")
+        return False
+
+    ready_symbols = []
+    for symbol, cycles in batch_cache.items():
+        if cycles:  # 至少有一个周期数据
+            ready_symbols.append(symbol)
+        else:
+            print(f"⚠️ {symbol} 缺少任何周期数据")
+
+    if not ready_symbols:
+        print("⚠️ 没有币种满足投喂条件")
+        return False
+
+    print(f"✅ 准备投喂的币种: {ready_symbols}")
+    return True
+
+def sentiment_to_signal(score):
+    if score >= 85:
+        return "🚨 极端过热 | 警惕顶部反转"
+    if score >= 70:
+        return "🟢 牛势强劲 |"
+    if score >= 50:
+        return "⚪ 中性震荡 | 耐心等待突破"
+    if score >= 30:
+        return "🟡 恐慌缓解"
+    return "🔥 极度恐慌"
+
+def _read_prompt():
+    try:
+        with open("prompt.txt", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return "You are a crypto short-term trend trader."
+
+# ================== API 预加载 ==================
+async def preload_all_api(dataset):
+    results = {
+        "funding": {}, "p24": {}, "oi": {}, "sentiment": {},
+        "oi_hist": {}, "big_pos": {}, "big_acc": {}, "global_acc": {},
+    }
+
+    def safe_call(func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except:
+            return None
+
+    loop = asyncio.get_running_loop()
+    executor = _preload_executor
+    tasks = []
+
+    for symbol, cycles in dataset.items():
+        tasks.append(loop.run_in_executor(executor, safe_call, get_funding_rate, symbol))
+        tasks.append(loop.run_in_executor(executor, safe_call, get_24hr_change, symbol))
+        tasks.append(loop.run_in_executor(executor, safe_call, get_open_interest, symbol))
+
+    completed = await asyncio.gather(*tasks)
+    idx = 0
+    for symbol, cycles in dataset.items():
+        results["funding"][symbol] = completed[idx]; idx += 1
+        results["p24"][symbol] = completed[idx]; idx += 1
+        results["oi"][symbol] = completed[idx]; idx += 1
+
+    return results
+
+async def preload_all_api_global(dataset_all):
+    unified_dataset = {}
+    for batch in dataset_all:
+        for symbol, cycles in batch.items():
+            if symbol not in unified_dataset:
+                unified_dataset[symbol] = {}
+            for interval, data in cycles.items():
+                if interval not in unified_dataset[symbol]:
+                    unified_dataset[symbol][interval] = data
+    print(f"🔄 全局预加载合并了 {len(unified_dataset)} 个币种")
+    return await preload_all_api(unified_dataset)
+
+# ================== JSON 提取（统一版） ==================
+def _extract_decision_block(content: str):
+    """提取 <decision> 标签内的 JSON 列表，支持 Claude HTML 转义形式"""
+    if not content:
+        return None
+
+    # 1️⃣ 先把 HTML/Unicode 转义替换回原始符号
+    content = html.unescape(content)  # \u003c -> <, \u003e -> >
+
+    match = re.search(r"<decision>([\s\S]*?)</decision>", content, flags=re.I)
+    if not match:
+        return None
+
+    block = match.group(1).strip()
+    try:
+        parsed = json.loads(block)
+        if isinstance(parsed, list):
+            return [x for x in parsed if isinstance(x, dict) and "action" in x]
+        if isinstance(parsed, dict) and "action" in parsed:
+            return [parsed]
+    except Exception as e:
+        logging.warning(f"⚠️ JSON 解析失败: {e}")
+        return None
+
+# 同理也可以改 _extract_reasoning_block，解码 HTML 转义
+def _extract_reasoning_block(content: str):
+    """提取 <reasoning> 标签内容，支持 HTML 转义"""
+    if not content:
+        return None
+    content = html.unescape(content)
+    match = re.search(r"<reasoning>([\s\S]*?)</reasoning>", content, flags=re.I)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+def _extract_all_json(content: str):
+    """
+    尝试提取所有可能的交易信号 JSON，
+    兼容 DeepSeek / Gemini / Claude，支持 HTML/Unicode 转义
+    """
+    if not content:
+        return None
+
+    # 1️⃣ 先将 HTML / Unicode 转义解码
+    content = html.unescape(content)  # \u003c -> <, \u003e -> >
+
+    results = []
+
+    # 2️⃣ 尝试直接解析整个内容
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, list):
+            return [x for x in parsed if isinstance(x, dict) and "action" in x]
+        if isinstance(parsed, dict) and "action" in parsed:
+            return [parsed]
+    except:
+        pass
+
+    # 3️⃣ 尝试从 <decision> 标签中解析
+    decision_match = re.search(r"<decision>([\s\S]*?)</decision>", content, flags=re.I)
+    if decision_match:
+        block = decision_match.group(1).strip()
+        try:
+            parsed = json.loads(block)
+            if isinstance(parsed, list):
+                return [x for x in parsed if isinstance(x, dict) and "action" in x]
+            if isinstance(parsed, dict) and "action" in parsed:
+                return [parsed]
+        except:
+            pass
+
+    # 4️⃣ 匹配单层 JSON 对象的老逻辑，保底解析
+    matches = re.findall(r'\{[^{}]*\}', content, flags=re.S)
+    for m in matches:
+        try:
+            obj = json.loads(m)
+            if isinstance(obj, dict) and "action" in obj:
+                results.append(obj)
+        except:
+            pass
+
+    return results if results else None
+
+def merge_market_snapshots(batch_results: list):
+    """
+    把多个 batch 的 formatted_request 中的 <JSON> 合并成一个
+    风格与单 batch 完全一致
+    """
+    merged = None
+
+    for r in batch_results:
+        if not isinstance(r, dict):
+            continue
+
+        req = r.get("formatted_request")
+        if not req:
+            continue
+
+        m = re.search(r"<JSON>([\s\S]*?)</JSON>", req)
+        if not m:
+            continue
+
+        snapshot = json.loads(html.unescape(m.group(1)))
+
+        if merged is None:
+            # 第一份作为骨架
+            merged = snapshot
+        else:
+            # 只合并 markets
+            merged["markets"].update(snapshot.get("markets", {}))
+
+    return merged
+
+def merge_llm_responses(batch_results: list):
+    """
+    合并多个 batch 的 LLM 返回，风格与单 batch 完全一致
+    """
+    merged_content = []
+    merged_reasoning = []
+    merged_signals = []
+
+    http_status = 200
+    finish_reason = None
+
+    for r in batch_results:
+        if not isinstance(r, dict):
+            continue
+
+        if r.get("content"):
+            merged_content.append(r["content"])
+
+        if r.get("reasoning"):
+            merged_reasoning.append(r["reasoning"])
+
+        if r.get("signals"):
+            sigs = r.get("signals") or []
+            # 过滤掉 None、非 dict、缺少 symbol 或 action 的信号
+            valid_sigs = [
+                s for s in sigs 
+                if s and isinstance(s, dict) 
+                and s.get("symbol") 
+                and s.get("action")
+            ]
+            merged_signals.extend(valid_sigs)
+
+        if r.get("http_status") != 200:
+            http_status = r.get("http_status")
+
+        if not finish_reason:
+            finish_reason = r.get("finish_reason")
+
+    return {
+        "content": "\n\n".join(merged_content) if merged_content else None,
+        "reasoning": "\n\n".join(merged_reasoning) if merged_reasoning else None,
+        "signals": merged_signals,
+        "http_status": http_status,
+        "finish_reason": finish_reason,
+        "timestamp": time.time()
+    }
+
+# ================== 持仓拆分 ==================
+def split_positions_batch(account, dataset_all, max_symbols=5):
+    """
+    拆分持仓批次，每个批次只包含一部分持仓币种 + positions + balance_info
+    支持部分币种缺失数据
+    """
+    positions = account.get("positions", [])
+    if not positions:
+        print("⚠️ 当前账户无持仓")
+        return []
+
+    balance_info = {
+        "balance": account.get("balance"),
+        "available": account.get("available"),
+        "total_unrealized": account.get("total_unrealized")
+    }
+
+    # 持仓币种对应数据
+    symbol_data = {}
+    for p in positions:
+        symbol = p["symbol"]
+        if symbol in dataset_all and dataset_all[symbol]:  # 只加入有数据的币种
+            symbol_data[symbol] = dataset_all[symbol]
+        else:
+            print(f"⚠️ 持仓币种 {symbol} 缺少数据，将跳过")
+
+    symbols = list(symbol_data.keys())
+    if not symbols:
+        print("⚠️ 所有持仓币种数据缺失，跳过持仓拆分")
+        return []
+
+    batches = []
+    for i in range(0, len(symbols), max_symbols):
+        batch_symbols = symbols[i:i+max_symbols]
+        batch = {"positions": positions, "balance_info": balance_info}
+        for s in batch_symbols:
+            batch[s] = symbol_data[s]
+        batches.append(batch)
+
+    print(f"✅ 拆分持仓批次数量: {len(batches)}")
+    return batches
+
+# ================== 批次拆分 ==================
+def split_dataset_by_symbol_limit(dataset: dict, max_symbols=5):
+    """
+    拆分非持仓币种批次，每批最多 max_symbols 个币种
+    支持部分币种缺少数据
+    """
+    batches = []
+
+    symbols = [k for k in dataset.keys() if k not in ("positions", "balance_info")]
+    items = [(k, dataset[k]) for k in symbols if dataset[k]]  # 只保留有数据的币种
+
+    if not items:
+        print("⚠️ 非持仓币种数据为空，跳过拆分")
+        return batches
+
+    for i in range(0, len(items), max_symbols):
+        batch = dict(items[i:i + max_symbols])
+        batches.append(batch)
+
+    print(f"✅ 拆分非持仓批次数量: {len(batches)}")
+    return batches
+
+# ================== 数据格式化 ==================
+def _build_dataset_json(dataset, preloaded=None):
+    """构建结构化 JSON 数据 - 对标投喂数据结构"""
+    account = account_snapshot
+    positions = dataset.get("positions", [])
+    balance_info = dataset.get("balance_info") or {
+        "balance": account.get("balance"),
+        "available": account.get("available"),
+        "total_unrealized": account.get("total_unrealized")
+    }
+    symbols_in_batch = [k for k in dataset.keys() if k not in ("positions", "balance_info")]
+    
+    # 过滤批次内持仓
+    if positions and symbols_in_batch:
+        positions = [p for p in positions if p["symbol"] in symbols_in_batch]
+    
+    # 构建 global_context
+    try:
+        from global_context import build_global_context, get_open_limit_orders
+        global_context = build_global_context(symbols_in_batch)
+        open_limit_orders = get_open_limit_orders()
+    except Exception:
+        global_context = {}
+        open_limit_orders = []
+    
+    output = {
+        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+        "data_freshness": "realtime",  # 标记数据包含实时信息
+        "balance_info": {
+            "balance": float(balance_info.get("balance", 0)),
+            "available": float(balance_info.get("available", 0)),
+            "total_unrealized": float(balance_info.get("total_unrealized", 0))
+        },
+        "global_context": global_context,
+        "open_limit_orders": open_limit_orders,
+        "positions": [],
+        "markets": {}
+    }
+    
+    # 构建持仓数据（包含峰值盈利和回撤信息）
+    from trade_tracker import get_active_trade
+    for p in positions:
+        symbol = p["symbol"]
+        size = float(p["size"])
+        side = "LONG" if size > 0 else "SHORT"
+        entry_price = float(p["entry"])
+        mark_price = float(p["mark_price"])
+        
+        # 计算当前盈亏百分比
+        if side == "LONG":
+            pnl_pct = round((mark_price - entry_price) / entry_price * 100, 2)
+        else:
+            pnl_pct = round((entry_price - mark_price) / entry_price * 100, 2)
+        
+        # 获取活跃交易记录（包含峰值和回撤）
+        trade_stats = get_active_trade(symbol, side)
+        peak_pnl_pct = 0
+        drawdown_from_peak_pct = 0
+        hold_minutes = 0
+        
+        if trade_stats:
+            peak_price = trade_stats.get("peak_price", entry_price)
+            entry_time = trade_stats.get("entry_time", time.time())
+            hold_minutes = int((time.time() - entry_time) / 60)
+            
+            # 计算峰值盈亏百分比
+            if side == "LONG":
+                peak_pnl_pct = round((peak_price - entry_price) / entry_price * 100, 2)
+            else:
+                peak_pnl_pct = round((entry_price - peak_price) / entry_price * 100, 2)
+            
+            # 计算从峰值的回撤百分比
+            if peak_pnl_pct > 0:
+                drawdown_from_peak_pct = round((peak_pnl_pct - pnl_pct) / peak_pnl_pct * 100, 1)
+        
+        pos_data = {
+            "symbol": symbol,
+            "side": side,
+            "size": abs(size),
+            "entry": entry_price,
+            "mark_price": mark_price,
+            "pnl": float(p["pnl"]),
+            "position_value": abs(size) * mark_price,
+            "pnl_pct": pnl_pct,
+            # 新增：峰值和回撤信息（帮助 AI 判断是否应该止盈）
+            "peak_pnl_pct": peak_pnl_pct,
+            "drawdown_from_peak_pct": drawdown_from_peak_pct,
+            "hold_minutes": hold_minutes,
+            "tp_sl": [f"{o['type']}={o['stopPrice']}" 
+                     for o in tp_sl_cache.get(symbol, {}).get(side, [])],
+            "last_update_time": time.time()
+        }
+        output["positions"].append(pos_data)
+    
+    # 构建市场数据
+    for symbol in symbols_in_batch:
+        cycles = dataset[symbol]
+        fr = preloaded.get("funding", {}).get(symbol)
+        p24 = preloaded.get("p24", {}).get(symbol)
+        oi_now = preloaded.get("oi", {}).get(symbol)
+        
+        # 获取实时价格
+        realtime_price = None
+        try:
+            rp = redis_client.get(f"realtime_price:{symbol}")
+            if rp:
+                realtime_price = float(rp)
+        except:
+            pass
+        
+        # 使用实时价格，如果没有则用24h数据
+        current_price = realtime_price or (p24['lastPrice'] if p24 else None)
+        
+        market_data = {
+            "price": current_price,
+            "realtime_price": realtime_price,  # 明确标记实时价格
+            "24h_high": p24['highPrice'] if p24 else None,
+            "24h_low": p24['lowPrice'] if p24 else None,
+            "24h_change_pct": p24['priceChangePercent'] if p24 else None,
+            "24h_volume_usd": round(p24['quoteVolume'] / 1e6, 2) if p24 else None,
+            "funding_rate": fr,
+            "open_interest": oi_now,
+            "timeframes": {}
+        }
+        
+        for interval in cycles.keys():
+            data = cycles[interval]
+            ind = data.get("indicators") or {}
+            
+            # 构建指标数据，保留完整结构
+            indicators_out = {}
+            for k, v in ind.items():
+                if isinstance(v, float):
+                    indicators_out[k] = round(v, 6)
+                elif isinstance(v, dict):
+                    indicators_out[k] = v
+                elif isinstance(v, list):
+                    indicators_out[k] = v
+                else:
+                    indicators_out[k] = v
+            
+            # 获取当前未收盘K线
+            current_candle = None
+            try:
+                cc_raw = redis_client.get(f"current_candle:{symbol}:{interval}")
+                if cc_raw:
+                    current_candle = json.loads(cc_raw)
+            except:
+                pass
+            
+            tf_data = {
+                "indicators": indicators_out
+            }
+            
+            # 添加当前K线信息（如果有）
+            if current_candle:
+                tf_data["current_candle"] = {
+                    "open": current_candle.get("Open"),
+                    "high": current_candle.get("High"),
+                    "low": current_candle.get("Low"),
+                    "close": current_candle.get("Close"),
+                    "volume": current_candle.get("Volume"),
+                    "is_closed": False,
+                    "seconds_to_close": current_candle.get("seconds_to_close", 0)
+                }
+            
+            market_data["timeframes"][interval] = tf_data
+
+        output["markets"][symbol] = market_data
+    
+    return output
+
+def build_llm_user_prompt(market_snapshot: dict) -> str:
+    """
+    把“约束文字 + JSON”组装成一次 LLM 的 user content
+    """
+    return f"""
+Below is the current account status and market snapshot data (JSON).
+
+This is a formal trading decision request.
+Please strictly follow the [System Instructions] to complete the multi-timeframe analysis and output a single, unique trading action.
+
+[Current Account Constraints]
+- Available account balance is limited; overtrading is prohibited; capital must grow steadily
+- Excessive trading and frequent repetitive entries are strictly prohibited
+- If risk or structure is unclear, choosing wait or hold is permitted
+
+[Current Account and Market Data]
+<JSON>
+{json_safe_dumps(market_snapshot)}
+</JSON>
+""".strip()
+
+# ================== AIBTC.VIP 批量投喂 ==================
+async def _push_single_batch_claude(dataset, preloaded, batch_idx, total_batches):
+    """
+    使用 AIBTC.VIP 模型进行批次投喂，兼容 Unicode/HTML 转义，保证 signals 完整
+    """
+    loop = asyncio.get_running_loop()
+    json_data = await loop.run_in_executor(None, _build_dataset_json, dataset, preloaded)
+    user_prompt = await loop.run_in_executor(None, build_llm_user_prompt, json_data)
+    system_prompt = await loop.run_in_executor(None, _read_prompt)
+
+    payload = {
+        "model": CLAUDE_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0,
+        "max_tokens": 8000,
+        "stream": False
+    }
+
+    max_retries = 3
+    base_timeout = 15  # 超时基准秒数
+
+    for attempt in range(max_retries):
+        attempt_start = time.perf_counter()
+        current_timeout = base_timeout * (attempt + 1)
+
+        try:
+            session = await get_http_session(CLAUDE_URL)
+
+            async with session.post(
+                CLAUDE_URL,
+                json=payload,
+                headers={"Authorization": f"Bearer {CLAUDE_API_KEY}"},
+                timeout=aiohttp.ClientTimeout(total=current_timeout)
+            ) as resp:
+
+                status = resp.status
+
+                if status != 200:
+                    raise aiohttp.ClientError(f"HTTP {status}")
+
+                raw_text = await resp.text()
+                attempt_time = round((time.perf_counter() - attempt_start) * 1000, 2)
+
+                print(
+                    f"✅ AIBTC.VIP 批次 {batch_idx} 第{attempt+1}次返回 | "
+                    f"{attempt_time}ms | HTTP {status}"
+                )
+
+                content = None
+                reasoning = None
+                signals = []
+                raw_json = None
+                finish_reason = None
+
+                try:
+                    raw_json = json.loads(raw_text)
+                    choice = raw_json.get("choices", [{}])[0]
+                    content = choice.get("message", {}).get("content")
+                    finish_reason = choice.get("finish_reason")
+                    reasoning = _extract_reasoning_block(content)
+
+                    if content:
+                        from html import unescape
+                        content_decoded = unescape(content)
+                        signals = _extract_all_json(content_decoded) or []
+
+                except Exception as parse_err:
+                    logging.warning(f"⚠️ AIBTC.VIP JSON 解析失败: {parse_err}")
+
+                return {
+                    "batch_idx": batch_idx,
+                    "formatted_request": user_prompt,  # ⭐ 已安全序列化
+                    "content": content,
+                    "reasoning": reasoning,
+                    "signals": signals,
+                    "raw_text": raw_text,
+                    "raw_json": raw_json,
+                    "finish_reason": finish_reason,
+                    "http_status": status,
+                    "ts": time.time(),
+                    "attempt": attempt + 1,
+                    "response_time_ms": attempt_time
+                }
+
+        except asyncio.TimeoutError:
+            attempt_time = round((time.perf_counter() - attempt_start) * 1000, 2)
+            print(f"⏱️ AIBTC.VIP 批次 {batch_idx} 第{attempt+1}次超时 ({attempt_time}ms)")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            else:
+                return {
+                    "batch_idx": batch_idx,
+                    "formatted_request": user_prompt,
+                    "signals": [],
+                    "raw_text": None,
+                    "raw_json": None,
+                    "finish_reason": None,
+                    "http_status": None,
+                    "error": f"批次 {batch_idx} 在{max_retries}次尝试后超时",
+                    "ts": time.time(),
+                    "attempt": max_retries,
+                    "response_time_ms": attempt_time
+                }
+
+        except aiohttp.ClientError as e:
+            attempt_time = round((time.perf_counter() - attempt_start) * 1000, 2)
+            print(f"🌐 Claude 批次 {batch_idx} 第{attempt+1}次网络错误: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(3 * (attempt + 1))
+                continue
+            else:
+                return {
+                    "batch_idx": batch_idx,
+                    "formatted_request": user_prompt,
+                    "signals": [],
+                    "raw_text": None,
+                    "raw_json": None,
+                    "finish_reason": None,
+                    "http_status": None,
+                    "error": f"批次 {batch_idx} 网络错误: {e}",
+                    "ts": time.time(),
+                    "attempt": max_retries,
+                    "response_time_ms": attempt_time
+                }
+
+        except Exception as e:
+            attempt_time = round((time.perf_counter() - attempt_start) * 1000, 2)
+            error_msg = f"批次 {batch_idx} 未知错误: {e}"
+            print(f"❌ {error_msg}")
+
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            else:
+                return {
+                    "batch_idx": batch_idx,
+                    "formatted_request": user_prompt,
+                    "signals": [],
+                    "raw_text": None,
+                    "raw_json": None,
+                    "finish_reason": None,
+                    "http_status": None,
+                    "error": error_msg,
+                    "ts": time.time(),
+                    "attempt": max_retries,
+                    "response_time_ms": attempt_time
+                }
+
+# ================== 小米 MiMo 批量投喂 ==================
+async def _push_single_batch_mimo(dataset, preloaded, batch_idx, total_batches):
+    """
+    使用小米 MiMo 模型进行批次投喂
+    """
+    loop = asyncio.get_running_loop()
+    json_data = await loop.run_in_executor(None, _build_dataset_json, dataset, preloaded)
+    user_prompt = await loop.run_in_executor(None, build_llm_user_prompt, json_data)
+    system_prompt = await loop.run_in_executor(None, _read_prompt)
+
+    payload = {
+        "model": MIMO_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.1,  # 降低温度，决策更稳定
+        "max_completion_tokens": 8000,
+        "stream": False,
+        "top_p": 0.9,  # 略微降低
+        "frequency_penalty": 0,
+        "presence_penalty": 0,
+        "thinking": {"type": "disabled"}
+    }
+
+    max_retries = 3
+    base_timeout = 15
+
+    for attempt in range(max_retries):
+        attempt_start = time.perf_counter()
+        current_timeout = base_timeout * (attempt + 1)
+
+        try:
+            session = await get_http_session(MIMO_URL)
+
+            async with session.post(
+                MIMO_URL,
+                json=payload,
+                headers={"Authorization": f"Bearer {MIMO_API_KEY}"},
+                timeout=aiohttp.ClientTimeout(total=current_timeout)
+            ) as resp:
+
+                status = resp.status
+
+                if status != 200:
+                    raise aiohttp.ClientError(f"HTTP {status}")
+
+                raw_text = await resp.text()
+                attempt_time = round((time.perf_counter() - attempt_start) * 1000, 2)
+
+                print(
+                    f"✅ MiMo 批次 {batch_idx} 第{attempt+1}次返回 | "
+                    f"{attempt_time}ms | HTTP {status}"
+                )
+
+                content = None
+                reasoning = None
+                signals = []
+                raw_json = None
+                finish_reason = None
+
+                try:
+                    raw_json = json.loads(raw_text)
+                    choice = raw_json.get("choices", [{}])[0]
+                    content = choice.get("message", {}).get("content")
+                    finish_reason = choice.get("finish_reason")
+                    reasoning = _extract_reasoning_block(content)
+
+                    if content:
+                        from html import unescape
+                        content_decoded = unescape(content)
+                        signals = _extract_all_json(content_decoded) or []
+
+                except Exception as parse_err:
+                    logging.warning(f"⚠️ MiMo JSON 解析失败: {parse_err}")
+
+                return {
+                    "batch_idx": batch_idx,
+                    "formatted_request": user_prompt,
+                    "content": content,
+                    "reasoning": reasoning,
+                    "signals": signals,
+                    "raw_text": raw_text,
+                    "raw_json": raw_json,
+                    "finish_reason": finish_reason,
+                    "http_status": status,
+                    "ts": time.time(),
+                    "attempt": attempt + 1,
+                    "response_time_ms": attempt_time
+                }
+
+        except asyncio.TimeoutError:
+            attempt_time = round((time.perf_counter() - attempt_start) * 1000, 2)
+            print(f"⏱️ MiMo 批次 {batch_idx} 第{attempt+1}次超时 ({attempt_time}ms)")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            else:
+                return {
+                    "batch_idx": batch_idx,
+                    "formatted_request": user_prompt,
+                    "signals": [],
+                    "raw_text": None,
+                    "raw_json": None,
+                    "finish_reason": None,
+                    "http_status": None,
+                    "error": f"批次 {batch_idx} 在{max_retries}次尝试后超时",
+                    "ts": time.time(),
+                    "attempt": max_retries,
+                    "response_time_ms": attempt_time
+                }
+
+        except aiohttp.ClientError as e:
+            attempt_time = round((time.perf_counter() - attempt_start) * 1000, 2)
+            print(f"🌐 MiMo 批次 {batch_idx} 第{attempt+1}次网络错误: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(3 * (attempt + 1))
+                continue
+            else:
+                return {
+                    "batch_idx": batch_idx,
+                    "formatted_request": user_prompt,
+                    "signals": [],
+                    "raw_text": None,
+                    "raw_json": None,
+                    "finish_reason": None,
+                    "http_status": None,
+                    "error": f"批次 {batch_idx} 网络错误: {e}",
+                    "ts": time.time(),
+                    "attempt": max_retries,
+                    "response_time_ms": attempt_time
+                }
+
+        except Exception as e:
+            attempt_time = round((time.perf_counter() - attempt_start) * 1000, 2)
+            error_msg = f"批次 {batch_idx} 未知错误: {e}"
+            print(f"❌ {error_msg}")
+
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            else:
+                return {
+                    "batch_idx": batch_idx,
+                    "formatted_request": user_prompt,
+                    "signals": [],
+                    "raw_text": None,
+                    "raw_json": None,
+                    "finish_reason": None,
+                    "http_status": None,
+                    "error": error_msg,
+                    "ts": time.time(),
+                    "attempt": max_retries,
+                    "response_time_ms": attempt_time
+                }
+
+# ================== 通用批量投喂 ==================
+async def push_batch_to_ai():
+    if not _is_ready_for_push():
+        return None
+
+    start_total = time.perf_counter()
+
+    dataset_all = batch_cache.copy()
+    batch_cache.clear()
+    all_signals = []
+
+    account = account_snapshot
+
+    # --- 1. 拆分持仓批次 ---
+    positions_batches = split_positions_batch(account, dataset_all, max_symbols=5)
+    positions_symbols = [
+        p["symbol"] for batch in positions_batches for p in batch.get("positions", [])
+    ]
+
+    # --- 2. 拆分非持仓币种 ---
+    symbol_dataset = {k: v for k, v in dataset_all.items() if k not in positions_symbols}
+    symbol_batches = split_dataset_by_symbol_limit(symbol_dataset, max_symbols=5)
+
+    # --- 3. 合并所有批次 ---
+    batches = positions_batches + symbol_batches
+
+    # --- 4. 预加载 ---
+    preloaded_batches = []
+    for batch in batches:
+        symbols_only = {k: v for k, v in batch.items() if k not in ("positions", "balance_info")}
+        preloaded = await preload_all_api(symbols_only) if symbols_only else {}
+        preloaded_batches.append(preloaded)
+
+    # --- 5. 创建投喂任务 ---
+    tasks = []
+    for idx, batch in enumerate(batches):
+        preloaded = preloaded_batches[idx]
+        if AI_PROVIDER == "claude":
+            tasks.append(
+                _push_single_batch_claude(batch, preloaded, idx + 1, len(batches))
+            )
+        elif AI_PROVIDER == "mimo":
+            tasks.append(
+                _push_single_batch_mimo(batch, preloaded, idx + 1, len(batches))
+            )
+        else:
+            raise ValueError(f"未知 AI_PROVIDER: {AI_PROVIDER}")
+
+    # --- 6. 执行投喂 ---
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # --- 统计 ---
+    success_count = 0
+    timeout_count = 0
+    total_elapsed_time = 0
+    success_response_time = 0
+
+    for r in results:
+        if not isinstance(r, dict):
+            timeout_count += 1
+            continue
+
+        rt = r.get("response_time_ms", 0)
+        total_elapsed_time += rt
+
+        if r.get("http_status") == 200:
+            success_count += 1
+            success_response_time += rt
+        elif "超时" in (r.get("error") or ""):
+            timeout_count += 1
+
+    valid_results = [r for r in results if isinstance(r, dict)]
+    valid_count = len(valid_results)
+    overall_avg = total_elapsed_time / valid_count if valid_count else 0
+
+    print(
+        f"📊 请求统计: 成功 {success_count}/{valid_count} | "
+        f"超时 {timeout_count} | "
+        f"整体平均耗时 {overall_avg:.0f}ms | "
+        f"成功平均耗时 {success_response_time / success_count if success_count else 0:.0f}ms"
+    )
+
+    # ================== ✅ Redis：单次投喂风格合并 ==================
+
+    round_ts = time.time()
+
+    # -------- KEY_REQ：合并后的完整 prompt --------
+    merged_snapshot = merge_market_snapshots(results)
+
+    if merged_snapshot:
+        merged_user_prompt = build_llm_user_prompt(merged_snapshot)
+
+        redis_client.rpush(
+            KEY_REQ,
+            json_safe_dumps({
+                "timestamp": round_ts,
+                "request": merged_user_prompt
+            })
+        )
+
+    # -------- KEY_RES：合并后的完整模型回复 --------
+    merged_response = merge_llm_responses(results)
+
+    redis_client.rpush(
+        KEY_RES,
+        json_safe_dumps(merged_response)
+    )
+
+    # 汇总 signals（给函数返回值用）
+    for r in results:
+        if isinstance(r, dict):
+            sigs = r.get("signals") or []
+            # 过滤掉 None、非 dict、缺少 symbol 或 action 的信号
+            valid_sigs = [
+                s for s in sigs 
+                if s and isinstance(s, dict) 
+                and s.get("symbol") 
+                and s.get("action")
+            ]
+            all_signals.extend(valid_sigs)
+
+    end_total = time.perf_counter()
+    print(
+        f"📊 请求统计: 投喂批次 {len(results)} | "
+        f"总耗时 {round((end_total - start_total), 2)} 秒"
+    )
+
+    return all_signals if all_signals else None
+
+# 别名保留
+push_batch_to_deepseek = push_batch_to_ai

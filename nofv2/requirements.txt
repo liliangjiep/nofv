@@ -1,0 +1,10 @@
+aiohttp
+aiohttp_socks
+fastapi
+numpy
+protobuf
+python_binance
+redis
+Requests
+ta_lib
+uvicorn
