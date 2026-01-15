@@ -1,8 +1,8 @@
 import redis
-from config import REDIS_HOST, REDIS_PORT, REDIS_DB
+from config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD, REDIS_USERNAME
 
 redis_client = redis.StrictRedis(
-    host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
+    host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, password=REDIS_PASSWORD, username=REDIS_USERNAME, decode_responses=True
 )
 
 def clear_redis():

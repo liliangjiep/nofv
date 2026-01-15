@@ -27,6 +27,10 @@ if not logger.handlers:
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
+    
+    # 设置控制台编码以支持Unicode字符
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
 
     # 添加处理器
     logger.addHandler(file_handler)

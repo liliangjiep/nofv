@@ -1,12 +1,12 @@
 from market_structure import MarketStructure
 
 # 实盘 API
-BINANCE_API_KEY_LIVE = "填入你的密钥"
-BINANCE_API_SECRET_LIVE = "填入你的密钥"
+BINANCE_API_KEY_LIVE = "SB4qrqmH9PPlTAdCRqnYr4fOhS0u1JEtr6QmccNR8ZboXZQclU4wA8NUA9kJhxA1"
+BINANCE_API_SECRET_LIVE = "9l186bg2bVMeFYKQllxyBOsI5VstaLH0Q2XQRDehLweWXQHTdvNgezVTBzS2bE27"
 
 # 测试网 API (去 https://testnet.binancefuture.com 申请)
-BINANCE_API_KEY_TEST = "填入你的密钥"  # 填入测试网 API Key
-BINANCE_API_SECRET_TEST = "填入你的密钥"  # 填入测试网 API Secret
+BINANCE_API_KEY_TEST = "i40fOhMXnr4J1x77o0hHJLIZkfoed6zKSjHK0o6ApSl5GBUrlpmJgnOWDKaOwfH7"  # 填入测试网 API Key
+BINANCE_API_SECRET_TEST = "R2LxTA7INQRstaFrM6Ur2SYL2YoGJqxm6OJ9FCHA6hcmUNy3QBsIuewSesmeV9wm"  # 填入测试网 API Secret
 
 # 环境切换: False=实盘, True=测试网
 BINANCE_ENVIRONMENT = True
@@ -22,6 +22,11 @@ else:
 # 代理配置（如果不需要代理，设为 None）
 PROXY = "http://127.0.0.1:7890"  # 改成你的代理地址和端口
 
+# 请求参数配置
+requests_params = {
+    'timeout': 10
+}
+
 TELEGRAM_BOT_TOKEN = "" #tg token
 TELEGRAM_CHAT_ID = "-" #tg 频道
 TG_ENABLED = False  # TG 推送开关：True=发送，False=不发送
@@ -33,28 +38,34 @@ CLAUDE_URL = ""
 
 
 # DeepSeek 配置 (你的原有配置)
-DEEPSEEK_API_KEY = ""  # deepseek key
+DEEPSEEK_API_KEY = "sk-2689093f27d1443881cb2e5a72c0e4b7"  # deepseek key
 DEEPSEEK_MODEL = "deepseek-reasoner"
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # Gemini 配置 (你的原有配置)
-GEMINI_API_KEY = ""
+GEMINI_API_KEY = "AIzaSyAiZXSacSBpPrdTuQ1XJSHI-HczE5CLqE4"
 GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_PROJECT = ""
+GEMINI_PROJECT = ""  # Gemini API 不需要项目ID
 
 # 小米 MiMo 配置
-MIMO_API_KEY = ""  # 小米 MiMo API Key
+MIMO_API_KEY = "sk-c7rusd30ccp6y0lmiityesv1jtlwd5f1kdithuq7pcz5cq76"  # 小米 MiMo API Key
 MIMO_MODEL = "mimo-v2-flash"
 MIMO_URL = "https://api.xiaomimimo.com/v1/chat/completions"
 
 # 投喂选择
-AI_PROVIDER = "mimo"  # 可选: "claude" / "deepseek" / "gemini" / "mimo"
+AI_PROVIDER = "deepseek"  # 可选: "claude" / "deepseek" / "gemini" / "mimo"
 
 # ===== 固定币种监控池 =====
 monitor_symbols = ['ETHUSDT', 'SOLUSDT']
 
 # ===== 仓位管理 =====
 MAX_POSITIONS = 10  # 最大同时持仓数量
+MIN_TRADE_AMOUNT = 50  # 最小交易金额，提高门槛降低交易频率
+MAX_POSITION_SIZE_USD = 500  # 最大持仓金额，控制风险
+
+# ===== AI调用优化 =====
+AI_REQUEST_INTERVAL = 60  # AI请求最小间隔（秒），避免过于频繁调用
+MIN_CONFIDENCE_SCORE = 0.3  # 最小置信度分数，只执行高置信度信号
 
 # ===== 调度时间间隔（分钟） =====
 SCAN_INTERVAL = 15   # 全量扫描间隔（扫描所有监控币种）
@@ -103,9 +114,11 @@ OI_BASE_URL = "https://fapi.binance.com"
 timeframes = ["4h", "1h", "15m"]
 
 # ===== Redis =====
-REDIS_HOST = "localhost"
+REDIS_HOST = "43.153.230.38"
 REDIS_PORT = 6379
 REDIS_DB = 10
+REDIS_PASSWORD = "085799."  # 如果Redis没有密码，请设为 None
+REDIS_USERNAME = "default"  # Redis ACL用户名，如不需要则设为 None
 
 #定义「周期 → EMA 参数映射」
 EMA_CONFIG = {
